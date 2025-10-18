@@ -1,3 +1,4 @@
+import 'dotenv/config'; // Load .env file
 import fs from 'fs';
 import path from 'path';
 import { TokenChunker } from "chonkie";
@@ -11,7 +12,8 @@ import {
 } from '@xenova/transformers';
 
 // --- CONFIGURATION ---
-const apiKey = "REMOVED_API_KEY";
+// API Key is now loaded from .env file
+const apiKey = process.env.DEEPSEEK_API_KEY;
 const userQuestion = "How do I use the Cron in Elysia?";
 const documentFilename = 'docs/llms-full.txt';
 const BATCH_SIZE = 10; // Process 10 chunks at a time
@@ -43,8 +45,8 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 }
 
 async function main() {
-    if (apiKey === "YOUR_DEEPSEEK_API_KEY_HERE") {
-        console.error("\n!!! Please put your DeepSeek API Key in deepseek-example.ts before running.");
+    if (!apiKey) {
+        console.error("\n!!! DEEPSEEK_API_KEY not found. Please ensure it is set in your .env file.");
         return;
     }
 
@@ -60,7 +62,7 @@ async function main() {
     const documentText = fs.readFileSync(filePath, 'utf-8');
 
     // 2. Chunk Document
-    const chunker = await TokenChunker.create({ chunkSize: 512, chunkOverlap: 10, minCharactersPerChunk: 24,});
+    const chunker = await TokenChunker.create({ chunkSize: 512, chunkOverlap: 10, minCharactersPerChunk: 24 });
     const rawChunks = await chunker(documentText);
     
     // 3. Clean and Filter Chunks
@@ -102,6 +104,8 @@ async function main() {
             bestChunkIndex = i;
         }
     }
+
+    console.log(`  > Found best chunk (Index: ${bestChunkIndex}) with similarity: ${maxSimilarity.toFixed(4)}`);
 
     // Create a context window of chunks around the best one
     const contextWindow = 2; // 2 chunks before and 2 after = up to 5 total
