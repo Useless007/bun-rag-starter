@@ -1,16 +1,10 @@
 {
-  "name": "rag-web-app",
-  "version": "1.0.0",
-  "description": "RAG Web Application with Graph + Vector Search",
+  "name": "chonk",
+  "module": "index.ts",
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "docker-compose up",
-    "build": "docker-compose build",
-    "up": "docker-compose up -d",
-    "down": "docker-compose down",
-    "logs": "docker-compose logs -f",
-    "clean": "docker-compose down -v"
+    "start": "bun index.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -21,7 +15,6 @@
   "dependencies": {
     "@chonkiejs/core": "^0.0.4",
     "@elysiajs/cors": "^1.4.0",
-    "@elysiajs/static": "^1.4.6",
     "@xenova/transformers": "^2.17.2",
     "chonkie": "^0.3.0",
     "dotenv": "^17.2.3",
