@@ -1,25 +1,23 @@
-import 'dotenv/config'; // Load .env file
+import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { TokenChunker } from "chonkie";
 import OpenAI from "openai";
-import {
-    pipeline, 
-    env,
-    type Pipeline,
-    type PipelineType,
-    type Tensor,
-} from '@xenova/transformers';
+import { pipeline, env, type Pipeline, type PipelineType, type Tensor } from '@xenova/transformers';
+import redisClient from './redis-client'; // Import the Redis client
+import { buildGraphFromChunks, queryGraph } from './graph-builder';
+
 
 // --- CONFIGURATION ---
-// API Key is now loaded from .env file
 const apiKey = process.env.DEEPSEEK_API_KEY;
 const userQuestion = "How do I use the Cron in Elysia?";
 const documentFilename = 'docs/llms-full.txt';
-const BATCH_SIZE = 10; // Process 10 chunks at a time
+const BATCH_SIZE = 10;
+const REDIS_INDEX_NAME = 'rag-index';
+const REDIS_KEY_PREFIX = 'chunk:';
+const CACHE_EXPIRATION_SECONDS = 3600; // 1 hour
 // --- END OF CONFIGURATION ---
 
-// Minimal logging from transformers.js
 env.allowLocalModels = false;
 
 class EmbeddingPipeline {
@@ -29,109 +27,128 @@ class EmbeddingPipeline {
 
     static async getInstance(progress_callback?: Function) {
         if (this.instance === null) {
-            console.log('[2/7] Loading embedding model... (This may take a moment on first run)');
+            console.log('[+] Loading embedding model...');
             this.instance = pipeline(this.task, this.model, { progress_callback });
         }
         return this.instance;
     }
 }
 
-function cosineSimilarity(vecA: number[], vecB: number[]): number {
-    const dotProduct = vecA.reduce((acc, val, i) => acc + val * vecB[i], 0);
-    const magA = Math.sqrt(vecA.reduce((acc, val) => acc + val * val, 0));
-    const magB = Math.sqrt(vecB.reduce((acc, val) => acc + val * val, 0));
-    if (magA === 0 || magB === 0) return 0;
-    return dotProduct / (magA * magB);
+async function createRedisIndex() {
+    try {
+        await redisClient.ft.create(REDIS_INDEX_NAME, {
+            '$.text': { type: 'TEXT', AS: 'text' },
+            '$.embedding': {
+                type: 'VECTOR',
+                ALGORITHM: 'HNSW',
+                TYPE: 'FLOAT32',
+                DIM: 384, // Dimension of all-MiniLM-L6-v2 embeddings
+                DISTANCE_METRIC: 'COSINE',
+                AS: 'embedding'
+            }
+        }, {
+            ON: 'JSON',
+            PREFIX: REDIS_KEY_PREFIX
+        });
+        console.log(`[+] Redis index "${REDIS_INDEX_NAME}" created successfully.`);
+    } catch (e: any) {
+        if (e.message.includes('Index already exists')) {
+            console.log(`[=] Redis index "${REDIS_INDEX_NAME}" already exists. Skipping creation.`);
+        } else {
+            console.error('[-] Error creating Redis index:', e);
+            throw e;
+        }
+    }
 }
 
-async function main() {
-    if (!apiKey) {
-        console.error("\n!!! DEEPSEEK_API_KEY not found. Please ensure it is set in your .env file.");
-        return;
-    }
+async function indexDocument(filePath: string, embedder: Pipeline): Promise<string[] | null> {
+    console.log(`\nIndexing document: ${documentFilename}`);
 
-    console.log("--- Starting RAG process ---");
-
-    // 1. Read Document
-    console.log(`\n[1/7] Reading document: ${documentFilename}`);
-    const filePath = path.join(process.cwd(), documentFilename);
     if (!fs.existsSync(filePath)) {
         console.error(`  > Error: File not found at ${filePath}`);
-        return;
+        return null;
     }
     const documentText = fs.readFileSync(filePath, 'utf-8');
 
-    // 2. Chunk Document
     const chunker = await TokenChunker.create({ chunkSize: 512, chunkOverlap: 10, minCharactersPerChunk: 24 });
     const rawChunks = await chunker(documentText);
     
-    // 3. Clean and Filter Chunks
-    console.log('\n[2/7] Cleaning and filtering text chunks...');
     const chunks = (Array.isArray(rawChunks) ? rawChunks : []).map(chunk => {
-        if (typeof chunk === 'string') return chunk;
-        if (typeof chunk === 'object' && chunk !== null && typeof (chunk as any).text === 'string') return (chunk as any).text;
-        return null;
+        return (typeof chunk === 'object' && chunk !== null && typeof (chunk as any).text === 'string') ? (chunk as any).text : null;
     }).filter((chunk): chunk is string => chunk !== null && chunk.trim() !== '');
-    console.log(`  > Started with ${Array.isArray(rawChunks) ? rawChunks.length : 0} raw chunks, ended with ${chunks.length} clean chunks.`);
 
+    console.log(`  > Document chunked into ${chunks.length} pieces.`);
+    console.log(`  > Generating and storing embeddings in Redis...`);
 
-    // 4. Get Embedding Model
-    const embedder = await EmbeddingPipeline.getInstance();
-
-    // 5. Generate Embeddings in Batches
-    console.log(`\n[3/7] Generating embeddings for ${chunks.length} chunks in batches of ${BATCH_SIZE}...`);
-    const chunkEmbeddings: Tensor[] = [];
+    const multi = redisClient.multi();
     for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
         const batch = chunks.slice(i, i + BATCH_SIZE);
-        console.log(`  > Processing batch ${Math.floor(i / BATCH_SIZE) + 1} of ${Math.ceil(chunks.length / BATCH_SIZE)}...`);
-        const batchEmbeddings = await embedder(batch, { pooling: 'mean', normalize: true });
-        chunkEmbeddings.push(...batchEmbeddings);
-    }
+        const batchEmbeddings: Tensor[] = await embedder(batch, { pooling: 'mean', normalize: true });
 
-    // 6. Generate Embedding for the user's question
-    console.log('\n[4/7] Generating embedding for the user question...');
-    const questionEmbedding = await embedder(userQuestion, { pooling: 'mean', normalize: true });
-
-    // 7. Find the most relevant chunk (Semantic Search)
-    console.log('\n[5/7] Performing semantic search...');
-    let bestChunkIndex = -1;
-    let maxSimilarity = -1;
-
-    for (let i = 0; i < chunkEmbeddings.length; i++) {
-        const similarity = cosineSimilarity(questionEmbedding.data, chunkEmbeddings[i].data);
-        if (similarity > maxSimilarity) {
-            maxSimilarity = similarity;
-            bestChunkIndex = i;
+        for (let j = 0; j < batch.length; j++) {
+            const chunkText = batch[j];
+            const embedding = Array.from(batchEmbeddings[j].data);
+            const key = `${REDIS_KEY_PREFIX}${i + j}`;
+            multi.json.set(key, '$', { text: chunkText, embedding: embedding });
         }
     }
+    await multi.exec();
+    console.log(`  > Successfully stored ${chunks.length} chunks and embeddings in Redis.`);
+    return chunks;
+}
 
-    console.log(`  > Found best chunk (Index: ${bestChunkIndex}) with similarity: ${maxSimilarity.toFixed(4)}`);
+async function searchRelevantChunks(query: string, embedder: Pipeline) {
+    console.log('\n[3/4] Searching for relevant chunks...');
+    const questionEmbeddingTensor: Tensor = await embedder(query, { pooling: 'mean', normalize: true });
+    const questionEmbedding = Buffer.from(new Float32Array(questionEmbeddingTensor.data).buffer);
 
-    // Create a context window of chunks around the best one
-    const contextWindow = 2; // 2 chunks before and 2 after = up to 5 total
-    const startIndex = Math.max(0, bestChunkIndex - contextWindow);
-    const endIndex = Math.min(chunks.length - 1, bestChunkIndex + contextWindow);
+    const searchQuery = `*=>[KNN 5 @embedding $query_vector AS score]`;
 
-    const contextChunks = chunks.slice(startIndex, endIndex + 1);
-    const combinedContext = contextChunks.join('\n\n---\n\n'); // Join chunks with a separator
+    const results = await redisClient.ft.search(REDIS_INDEX_NAME, searchQuery, {
+        PARAMS: { query_vector: questionEmbedding },
+        RETURN: ['text', 'score'],
+        DIALECT: 2
+    });
 
-    console.log(`  > Providing ${contextChunks.length} chunks as context (from index ${startIndex} to ${endIndex}).`);
-    console.log(`  > Combined Context Preview: "${combinedContext.substring(0, 400)}"...`);
+    console.log(`  > Found ${results.documents.length} relevant chunks.`);
+    return results.documents.map(doc => doc.value.text as string);
+}
 
-    // 8. Ask the LLM
-    console.log('\n[6/7] Sending combined context and question to DeepSeek API...');
-    const deepseek = new OpenAI({ apiKey, baseURL: "https://api.deepseek.com/v1" });
+async function askLLM(context: string, question: string) {
+    const useOllama = process.env.USE_OLLAMA === 'true';
+    const llmProvider = useOllama ? 'Ollama' : 'DeepSeek';
+    console.log(`\n[3/3] Sending context and question to ${llmProvider} API...`);
+
+    const cacheKey = `answer:${llmProvider}:${question}`;
+
+    // Check cache first
+    const cachedAnswer = await redisClient.get(cacheKey);
+    if (cachedAnswer) {
+        console.log("  > Found answer in cache!");
+        return cachedAnswer;
+    }
+
+    console.log("  > No cache hit. Querying LLM...");
+
+    const openaiConfig: OpenAI.ClientOptions = useOllama
+        ? { baseURL: "http://ollama:11434/v1", apiKey: "ollama" } // apiKey is required but not used by Ollama
+        : { apiKey, baseURL: "https://api.deepseek.com/v1" };
+
+    const model = useOllama ? "llama3" : "deepseek-chat"; // Example model for Ollama
+
+    const llmClient = new OpenAI(openaiConfig);
+
     const prompt = `
         Based *only* on the following context, please answer the question.
 
-        Context: "${combinedContext}"
+        Context: "${context}"
 
-        Question: "${userQuestion}"
+        Question: "${question}"
     `;
 
     try {
-        const completion = await deepseek.chat.completions.create({
-            model: "deepseek-chat",
+        const completion = await llmClient.chat.completions.create({
+            model: model,
             messages: [
                 { role: "system", content: "You are a helpful assistant that answers questions based strictly on the provided context." },
                 { role: "user", content: prompt },
@@ -139,14 +156,77 @@ async function main() {
         });
 
         const answer = completion.choices[0].message.content;
-        console.log("\n[7/7] Final Answer Received:");
-        console.log(answer);
+
+        // Cache the new answer
+        if (answer) {
+            await redisClient.set(cacheKey, answer, { 'EX': CACHE_EXPIRATION_SECONDS });
+            console.log("  > Saved new answer to cache.");
+        }
+
+        return answer;
 
     } catch (error) {
-        console.error("\nError calling DeepSeek API:", error);
+        console.error("\n[-] Error calling DeepSeek API:", error);
+        return null;
+    }
+}
+
+
+async function main() {
+    if (!apiKey) {
+        console.error("\n!!! DEEPSEEK_API_KEY not found. Please ensure it is set in your .env file.");
+        return;
+    }
+
+    console.log("--- Starting RAG process with Redis ---");
+
+    const embedder = await EmbeddingPipeline.getInstance();
+    const filePath = path.join(process.cwd(), documentFilename);
+
+    // Setup Redis Index
+    await createRedisIndex();
+
+    // Check if the document is already indexed in Redis
+    const indexedKeys = await redisClient.keys(`${REDIS_KEY_PREFIX}*`);
+    if (indexedKeys.length === 0) {
+        // If not indexed, we also assume the graph has not been built
+        console.log('\n[1/4] Document not indexed. Starting full indexing process...');
+        const chunks = await indexDocument(filePath, embedder);
+        if (chunks) {
+            await buildGraphFromChunks(chunks);
+        }
+    } else {
+        console.log(`\n[1/4] Document appears to be already indexed (${indexedKeys.length} chunks found). Skipping indexing.`);
+        console.log('[2/4] Skipping graph building.');
+    }
+
+    // --- QUERYING ---
+
+    // 1. Query the graph
+    const graphContext = await queryGraph(userQuestion);
+
+    // 2. Search for chunks relevant to the user's question
+    const relevantChunks = await searchRelevantChunks(userQuestion, embedder);
+
+    // 3. Combine contexts
+    const vectorContext = relevantChunks.join('\n\n---\n\n');
+    const combinedContext = `${graphContext}\n\n${vectorContext}`;
+
+    console.log(`  > Combined Context Preview: "${combinedContext.substring(0, 400)}"...`);
+
+
+    // 4. Ask the LLM with the retrieved context
+    const answer = await askLLM(combinedContext, userQuestion);
+
+    if (answer) {
+        console.log("\n[+] Final Answer Received:");
+        console.log(answer);
     }
 
     console.log("\n--- RAG process finished ---");
+
+    // Disconnect from Redis cleanly
+    await redisClient.quit();
 }
 
 main();
